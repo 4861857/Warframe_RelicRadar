@@ -64,3 +64,9 @@ python wf_price_tool.py --refresh             # 重新下载两份缓存
 - **弹窗被游戏挡住**：置顶窗在“独占全屏”下无法显示，请把游戏改成**无边框窗口**模式，或用第二块屏幕。
 - **游戏以管理员运行**：此时脚本也要以管理员运行，否则热键钩子收不到来自游戏的消息。
 - **识别不到道具**：确认画面停留在报酬界面、道具名清晰无遮挡；可先用 `--image` 对截图试跑排查。
+
+## 效果截图
+<img width="2557" height="1440" alt="image" src="https://github.com/user-attachments/assets/2c83ef68-6821-4f80-b39e-579c249da0df" />
+<img width="919" height="640" alt="image" src="https://github.com/user-attachments/assets/34e9edfc-aa78-48f1-a4b4-d45282ea21a4" />
+
+

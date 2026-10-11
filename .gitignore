@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# 数据缓存（可用 --refresh 重新生成）
+item_names.json
+relic_drops.json

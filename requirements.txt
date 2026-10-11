@@ -1,0 +1,5 @@
+rapidocr_onnxruntime>=1.2.0
+mss>=9.0
+keyboard>=0.13.5
+rapidfuzz>=3.0.0
+pillow>=10.0

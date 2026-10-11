@@ -346,9 +346,33 @@ def build_ui():
     f_price = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
     f_badge = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
 
-    status = tk.Label(root, text="正在初始化...", bg="#14161a", fg="#8b93a1",
+    # 顶栏：状态文字 + 右上角图钉（切换是否置顶）
+    topbar = tk.Frame(root, bg="#14161a")
+    topbar.pack(fill="x", padx=12, pady=(10, 2))
+
+    status = tk.Label(topbar, text="正在初始化...", bg="#14161a", fg="#8b93a1",
                       font=f_sub, anchor="w")
-    status.pack(fill="x", padx=12, pady=(10, 2))
+    status.pack(side="left", fill="x", expand=True)
+
+    pin_state = {"on": True}
+
+    def _update_pin():
+        if pin_state["on"]:
+            pin_btn.config(text="📌", bg="#e0a33a", fg="#14161a",
+                           activebackground="#e0a33a", activeforeground="#14161a")
+        else:
+            pin_btn.config(text="📌", bg="#2c313a", fg="#8b93a1",
+                           activebackground="#2c313a", activeforeground="#8b93a1")
+
+    def toggle_pin():
+        pin_state["on"] = not pin_state["on"]
+        root.attributes("-topmost", pin_state["on"])
+        _update_pin()
+
+    pin_btn = tk.Button(topbar, text="📌", command=toggle_pin, relief="flat", bd=0,
+                        font=f_sub, cursor="hand2", padx=6)
+    pin_btn.pack(side="right")
+    _update_pin()
 
     frame = tk.Frame(root, bg="#14161a")
     frame.pack(fill="both", expand=True, padx=8, pady=(0, 10))

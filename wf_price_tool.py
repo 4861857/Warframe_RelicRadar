@@ -70,6 +70,7 @@ def _make_opener(proxy):
 # 记住第一次成功的代理，之后复用，避免每次都重新探测
 _UNSET = object()
 _PREFERRED_PROXY = _UNSET
+MAX_RETRIES = 3                      # 瞬时网络错误（连接重置/超时）的重试次数
 
 
 def urlopen_json(url, timeout=PRICE_TIMEOUT):
@@ -96,15 +97,28 @@ def urlopen_json(url, timeout=PRICE_TIMEOUT):
     last = None
     for p in candidates:
         opener = _make_opener(p)
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            t = DIRECT_TIMEOUT if (p is None and PROXY is None and len(candidates) > 1) else timeout
-            with opener.open(req, timeout=t) as r:
-                data = json.loads(r.read().decode("utf-8"))
-            _PREFERRED_PROXY = p
-            return data
-        except Exception as e:
-            last = e
+        t = DIRECT_TIMEOUT if (p is None and PROXY is None and len(candidates) > 1) else timeout
+        for attempt in range(MAX_RETRIES):
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with opener.open(req, timeout=t) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                _PREFERRED_PROXY = p
+                return data
+            except urllib.error.HTTPError as e:
+                # 5xx / 限流才值得重试；其余 HTTP 错误放弃该通道
+                if e.code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES - 1:
+                    last = e
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                last = e
+                break
+            except Exception as e:
+                # 连接重置(10054)、超时等瞬时错误：换新连接重试
+                last = e
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
     raise last
 
 
@@ -278,7 +292,10 @@ def process_once(registry, image=None):
 
     results = []
     for it in items:
-        low, high = get_item_price(it["slug"])
+        try:
+            low, high = get_item_price(it["slug"])
+        except Exception:
+            low, high = None, None          # 单个查价失败不影响其它道具
         results.append({
             "zh": it["zh"], "en": it["en"], "slug": it["slug"],
             "low_sell": low, "high_buy": high,
@@ -296,11 +313,13 @@ def build_ui():
     root.title("虚空裂缝报酬估价")
     root.attributes("-topmost", True)
     root.configure(bg="#14161a")
+    root.geometry("620x420")          # 启动时的窗口大小
+    root.minsize(540, 320)            # 最小尺寸
 
-    f_name = tkfont.Font(family="Microsoft YaHei UI", size=12, weight="bold")
-    f_sub = tkfont.Font(family="Microsoft YaHei UI", size=9)
-    f_price = tkfont.Font(family="Microsoft YaHei UI", size=12, weight="bold")
-    f_badge = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
+    f_name = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
+    f_sub = tkfont.Font(family="Microsoft YaHei UI", size=18)
+    f_price = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
+    f_badge = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
 
     status = tk.Label(root, text="正在初始化...", bg="#14161a", fg="#8b93a1",
                       font=f_sub, anchor="w")
@@ -321,6 +340,7 @@ def _vaulted_label(v):
 
 
 def render_results(root, status, frame, fonts, results, err=None):
+    import tkinter as tk
     f_name, f_sub, f_price, f_badge = fonts
     for w in frame.winfo_children():
         w.destroy()

@@ -31,6 +31,7 @@ PRICE_TIMEOUT = 8                    # 查价请求超时（秒）
 DIRECT_TIMEOUT = 5                   # 直连探测超时（秒），失败后回退本地代理
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "item_names.json")
 RELIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relic_drops.json")
+PRICE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "price_cache.json")
 API_BASE = "https://api.warframe.market/v2"
 # 遗物掉落表（item -> 来源遗物）来源：WFCD/warframe-drop-data
 DROP_DATA_URL = ("https://raw.githubusercontent.com/WFCD/warframe-drop-data/"
@@ -254,6 +255,35 @@ def get_item_price(slug):
     return low_sell, high_buy
 
 
+class PriceCache:
+    """价格缓存：识别后先显示上次缓存价，后台刷新后再更新。"""
+    def __init__(self, path):
+        self.path = path
+        self.data = {}
+        self.load()
+
+    def load(self):
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+        except Exception:
+            self.data = {}
+
+    def get(self, slug):
+        return self.data.get(slug)          # {"low":..., "high":..., "ts":...}
+
+    def update(self, prices):
+        now = time.time()
+        for slug, p in prices.items():
+            self.data[slug] = {"low": p["low"], "high": p["high"], "ts": now}
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- 截图 + OCR
 def capture_screen():
     import mss
@@ -296,7 +326,8 @@ def warmup():
 
 
 # ---------------------------------------------------------------- 主流程
-def process_once(registry, image=None):
+def identify_items(registry, image=None):
+    """截图 + OCR + 匹配，返回识别出的道具 [{slug, zh, en}]。"""
     img = image if image is not None else capture_screen()
     lines = ocr_image(img)
     seen, items = set(), []
@@ -305,10 +336,11 @@ def process_once(registry, image=None):
         if it and it["slug"] not in seen:
             seen.add(it["slug"])
             items.append(it)
+    return items
 
-    if not items:
-        return []
 
+def fetch_fresh_prices(items):
+    """并行拉取最新价，返回 {slug: {"low": ..., "high": ...}}。"""
     from concurrent.futures import ThreadPoolExecutor
 
     def fetch(it):
@@ -316,17 +348,37 @@ def process_once(registry, image=None):
             low, high = get_item_price(it["slug"])
         except Exception:
             low, high = None, None          # 单个查价失败不影响其它道具
-        return it, low, high
+        return it["slug"], {"low": low, "high": high}
 
+    prices = {}
+    if items:
+        with ThreadPoolExecutor(max_workers=len(items)) as ex:   # 并行查价
+            for slug, p in ex.map(fetch, items):
+                prices[slug] = p
+    return prices
+
+
+def build_results(registry, items, prices):
+    """items + 价格字典 {slug:{low,high[,ts]}} -> 结果列表。"""
     results = []
-    with ThreadPoolExecutor(max_workers=len(items)) as ex:   # 并行查价
-        for it, low, high in ex.map(fetch, items):
-            results.append({
-                "zh": it["zh"], "en": it["en"], "slug": it["slug"],
-                "low_sell": low, "high_buy": high,
-                "vaulted": registry.vaulted_status(it),
-            })
+    for it in items:
+        p = prices.get(it["slug"])
+        results.append({
+            "zh": it["zh"], "en": it["en"], "slug": it["slug"],
+            "low_sell": p["low"] if p else None,
+            "high_buy": p["high"] if p else None,
+            "cache_ts": p.get("ts") if p else None,   # 缓存价的时间戳（无则 None）
+            "vaulted": registry.vaulted_status(it),
+        })
     return results
+
+
+def process_once(registry, image=None):
+    """一次性：识别 + 查价（--image 模式用，无缓存）。"""
+    items = identify_items(registry, image)
+    if not items:
+        return []
+    return build_results(registry, items, fetch_fresh_prices(items))
 
 
 # ---------------------------------------------------------------- GUI
@@ -388,7 +440,21 @@ def _vaulted_label(v):
     return ("未知", "#5a616b")
 
 
-def render_results(root, status, frame, fonts, results, err=None):
+def _fmt_age(ts):
+    """把时间戳格式化成「刚刚 / N分钟前 / N小时前 / N天前」。"""
+    if not ts:
+        return None
+    sec = max(0, int(time.time() - ts))
+    if sec < 60:
+        return "刚刚"
+    if sec < 3600:
+        return f"{sec // 60}分钟前"
+    if sec < 86400:
+        return f"{sec // 3600}小时前"
+    return f"{sec // 86400}天前"
+
+
+def render_results(root, status, frame, fonts, results, err=None, status_text=None):
     import tkinter as tk
     f_name, f_sub, f_price, f_badge = fonts
     for w in frame.winfo_children():
@@ -397,9 +463,9 @@ def render_results(root, status, frame, fonts, results, err=None):
     if err:
         status.config(text=err, fg="#e05c5c")
     elif not results:
-        status.config(text="未识别到道具，请确认画面停留在报酬界面", fg="#d8b34a")
+        status.config(text=status_text or "未识别到道具，请确认画面停留在报酬界面", fg="#d8b34a")
     else:
-        status.config(text=f"识别完成 · {len(results)} 件 · 按 {HOTKEY.upper()} 重新识别", fg="#6bc17b")
+        status.config(text=status_text or f"识别完成 · {len(results)} 件 · 按 {HOTKEY.upper()} 重新识别", fg="#6bc17b")
 
     if not results:
         return
@@ -430,6 +496,11 @@ def render_results(root, status, frame, fonts, results, err=None):
                  bg="#1e2229", fg="#3ab0d8" if high is not None else "#5a616b",
                  font=f_price).pack(side="left", padx=(18, 0))
 
+        age = _fmt_age(r.get("cache_ts"))
+        if age:
+            tk.Label(bot, text=f"缓存·{age}", bg="#1e2229", fg="#5a616b",
+                     font=f_sub).pack(side="right")
+
 
 # ---------------------------------------------------------------- 入口
 def run_gui(registry):
@@ -438,6 +509,8 @@ def run_gui(registry):
 
     # 后台预热：确定网络通道 + 加载 OCR 模型，减少首次按键延迟
     threading.Thread(target=warmup, daemon=True).start()
+
+    price_cache = PriceCache(PRICE_CACHE_FILE)
 
     q = queue.Queue()
     busy = threading.Event()
@@ -448,8 +521,21 @@ def run_gui(registry):
         busy.set()
         q.put(("status", "识别中..."))
         try:
-            results = process_once(registry)
-            q.put(("result", results))
+            items = identify_items(registry)
+            if not items:
+                q.put(("result", [], "未识别到道具，请确认画面停留在报酬界面"))
+                return
+
+            # 1) 先用缓存价立即显示
+            cached = {it["slug"]: price_cache.get(it["slug"]) for it in items}
+            q.put(("result", build_results(registry, items, cached),
+                   f"识别完成 · {len(items)} 件 · 显示缓存价，更新中…"))
+
+            # 2) 后台刷新最新价，刷新显示并写入缓存
+            fresh = fetch_fresh_prices(items)
+            price_cache.update(fresh)
+            q.put(("result", build_results(registry, items, fresh),
+                   f"识别完成 · {len(items)} 件 · 已更新 · 按 {HOTKEY.upper()} 重试"))
         except Exception as e:
             q.put(("error", f"出错: {e}"))
         finally:
@@ -458,13 +544,14 @@ def run_gui(registry):
     def poll():
         try:
             while True:
-                kind, payload = q.get_nowait()
+                msg = q.get_nowait()
+                kind = msg[0]
                 if kind == "status":
-                    status.config(text=payload, fg="#8b93a1")
+                    status.config(text=msg[1], fg="#8b93a1")
                 elif kind == "result":
-                    render_results(root, status, frame, fonts, payload)
+                    render_results(root, status, frame, fonts, msg[1], status_text=msg[2])
                 elif kind == "error":
-                    render_results(root, status, frame, fonts, [], err=payload)
+                    render_results(root, status, frame, fonts, [], err=msg[1])
         except queue.Empty:
             pass
         root.after(100, poll)

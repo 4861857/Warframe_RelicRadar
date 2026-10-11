@@ -27,8 +27,8 @@ HOTKEY = "f9"                        # 触发热键（单个键名，如 f9 / f1
 PROXY = None                         # 默认直连；若需代理填 "http://127.0.0.1:7890"
 MONITOR = 1                          # 截图的显示器编号（1 = 主屏）
 MATCH_CUTOFF = 85                    # 道具名匹配阈值（0-100，越高越严格）
-PRICE_TIMEOUT = 15                   # 查价请求超时（秒）
-DIRECT_TIMEOUT = 8                   # 直连探测超时（秒），失败后回退本地代理
+PRICE_TIMEOUT = 8                    # 查价请求超时（秒）
+DIRECT_TIMEOUT = 5                   # 直连探测超时（秒），失败后回退本地代理
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "item_names.json")
 RELIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relic_drops.json")
 API_BASE = "https://api.warframe.market/v2"
@@ -279,6 +279,22 @@ def ocr_image(img):
     return [(box, text, float(score)) for box, text, score in result]
 
 
+# ---------------------------------------------------------------- 预热
+def warmup():
+    """后台预热：确定可用网络通道 + 预加载 OCR 模型，减少首次按键延迟。"""
+    try:
+        urlopen_json(f"{API_BASE}/versions", timeout=8)
+    except Exception:
+        pass
+    try:
+        global _OCR_ENGINE
+        from rapidocr_onnxruntime import RapidOCR
+        if _OCR_ENGINE is None:
+            _OCR_ENGINE = RapidOCR()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 主流程
 def process_once(registry, image=None):
     img = image if image is not None else capture_screen()
@@ -290,17 +306,26 @@ def process_once(registry, image=None):
             seen.add(it["slug"])
             items.append(it)
 
-    results = []
-    for it in items:
+    if not items:
+        return []
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch(it):
         try:
             low, high = get_item_price(it["slug"])
         except Exception:
             low, high = None, None          # 单个查价失败不影响其它道具
-        results.append({
-            "zh": it["zh"], "en": it["en"], "slug": it["slug"],
-            "low_sell": low, "high_buy": high,
-            "vaulted": registry.vaulted_status(it),
-        })
+        return it, low, high
+
+    results = []
+    with ThreadPoolExecutor(max_workers=len(items)) as ex:   # 并行查价
+        for it, low, high in ex.map(fetch, items):
+            results.append({
+                "zh": it["zh"], "en": it["en"], "slug": it["slug"],
+                "low_sell": low, "high_buy": high,
+                "vaulted": registry.vaulted_status(it),
+            })
     return results
 
 
@@ -313,8 +338,8 @@ def build_ui():
     root.title("虚空裂缝报酬估价")
     root.attributes("-topmost", True)
     root.configure(bg="#14161a")
-    root.geometry("620x420")          # 启动时的窗口大小
-    root.minsize(540, 320)            # 最小尺寸
+    root.geometry("800x600")          # 启动时的窗口大小
+    root.minsize(700, 500)            # 最小尺寸
 
     f_name = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
     f_sub = tkfont.Font(family="Microsoft YaHei UI", size=18)
@@ -386,6 +411,9 @@ def render_results(root, status, frame, fonts, results, err=None):
 def run_gui(registry):
     import tkinter as tk
     root, status, frame, fonts = build_ui()
+
+    # 后台预热：确定网络通道 + 加载 OCR 模型，减少首次按键延迟
+    threading.Thread(target=warmup, daemon=True).start()
 
     q = queue.Queue()
     busy = threading.Event()

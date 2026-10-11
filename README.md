@@ -1,7 +1,7 @@
 # 虚空裂缝报酬 自动估价
 
 由于本人最近在瘾星际战甲，因此为了解决自己的痛点，帮助萌新快速识别遗物道具的稀有性，就用AI做了这个工具，亲测可用，但有时候因为网络问题，可能会超出15s的道具选择时间，但，有比没有好，不是吗。
-各位萌新也可以填一下我的激活码，给我蹭点蚊子腿：01C3-6EF7-08B5
+各位萌新也可以填一下我的邀请码，给我蹭点蚊子腿：01C3-6EF7-08B5
 
 在《星际战甲》(Warframe) 虚空裂缝结算界面，按一个热键，自动截图 → OCR 识别道具 → 从 [warframe.market](https://warframe.market/zh-hans/) 抓取价格 → 弹窗显示，并标注每个道具的**入库 / 出库**状态。
 
@@ -67,6 +67,7 @@ python wf_price_tool.py --refresh             # 重新下载两份缓存
 
 ## 效果截图
 <img width="2557" height="1440" alt="image" src="https://github.com/user-attachments/assets/2c83ef68-6821-4f80-b39e-579c249da0df" />
-<img width="919" height="640" alt="image" src="https://github.com/user-attachments/assets/34e9edfc-aa78-48f1-a4b4-d45282ea21a4" />
+<img width="912" height="631" alt="image" src="https://github.com/user-attachments/assets/29756a1a-7a16-41ed-9089-0d60db0d9c8f" />
+
 
 

@@ -28,6 +28,7 @@ PROXY = None                         # 默认直连；若需代理填 "http://12
 MONITOR = 1                          # 截图的显示器编号（1 = 主屏）
 MATCH_CUTOFF = 85                    # 道具名匹配阈值（0-100，越高越严格）
 PRICE_TIMEOUT = 8                    # 查价请求超时（秒）
+CAPTURE_TIMEOUT = 30                 # 单次识别看门狗超时（秒），卡住时强制解锁热键
 DIRECT_TIMEOUT = 5                   # 直连探测超时（秒），失败后回退本地代理
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "item_names.json")
 RELIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relic_drops.json")
@@ -296,14 +297,16 @@ def capture_screen():
 
 
 _OCR_ENGINE = None
+_OCR_LOCK = threading.Lock()        # OCR 引擎非线程安全，识别线程可能并发，需加锁
 
 
 def ocr_image(img):
     from rapidocr_onnxruntime import RapidOCR
     global _OCR_ENGINE
-    if _OCR_ENGINE is None:
-        _OCR_ENGINE = RapidOCR()
-    result, _ = _OCR_ENGINE(img)
+    with _OCR_LOCK:
+        if _OCR_ENGINE is None:
+            _OCR_ENGINE = RapidOCR()
+        result, _ = _OCR_ENGINE(img)
     if not result:
         return []
     return [(box, text, float(score)) for box, text, score in result]
@@ -390,7 +393,7 @@ def build_ui():
     root.title("虚空裂缝报酬估价")
     root.attributes("-topmost", True)
     root.configure(bg="#14161a")
-    root.geometry("800x600")          # 启动时的窗口大小
+    root.geometry("700x500")          # 启动时的窗口大小
     root.minsize(700, 500)            # 最小尺寸
 
     f_name = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
@@ -426,10 +429,33 @@ def build_ui():
     pin_btn.pack(side="right")
     _update_pin()
 
+    # 滚动区域：Canvas + 滚动条，条目多时可滚动
     frame = tk.Frame(root, bg="#14161a")
     frame.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
-    return root, status, frame, (f_name, f_sub, f_price, f_badge)
+    canvas = tk.Canvas(frame, bg="#14161a", highlightthickness=0)
+    scrollbar = tk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas, bg="#14161a")
+
+    inner.bind("<Configure>",
+               lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _sync_width(_e):
+        canvas.itemconfig(_win, width=canvas.winfo_width())
+
+    canvas.bind("<Configure>", _sync_width)
+
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    root.bind_all("<MouseWheel>", _on_mousewheel)   # 单窗口应用，滚轮统一滚结果区
+
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    return root, status, inner, (f_name, f_sub, f_price, f_badge)
 
 
 def _vaulted_label(v):
@@ -459,6 +485,7 @@ def render_results(root, status, frame, fonts, results, err=None, status_text=No
     f_name, f_sub, f_price, f_badge = fonts
     for w in frame.winfo_children():
         w.destroy()
+    frame.master.yview_moveto(0.0)   # 每次刷新回滚到顶部
 
     if err:
         status.config(text=err, fg="#e05c5c")
@@ -515,11 +542,8 @@ def run_gui(registry):
     q = queue.Queue()
     busy = threading.Event()
 
-    def do_capture():
-        if busy.is_set():
-            return
-        busy.set()
-        q.put(("status", "识别中..."))
+    def capture_worker():
+        # 重活（截图/OCR/查价）放在独立线程里做，绝不占用 keyboard 的监听线程。
         try:
             items = identify_items(registry)
             if not items:
@@ -541,6 +565,22 @@ def run_gui(registry):
         finally:
             busy.clear()
 
+    def _unlock_if_stuck():
+        # 看门狗：截图/OCR 可能挂起（尤其挂机/睡眠后），超时强制解锁，保证 F9 始终可用。
+        if busy.is_set():
+            q.put(("error", "识别超时（截图/OCR 卡住），已解锁热键，请重试"))
+            busy.clear()
+
+    def do_capture():
+        # 热键回调必须立刻返回。若在此阻塞，keyboard 的监听线程被堵死，
+        # 之后按 F9 就再也没反应（即「挂机太久按 F9 没反应」）。
+        if busy.is_set():
+            return
+        busy.set()
+        q.put(("status", "识别中..."))
+        threading.Thread(target=capture_worker, daemon=True).start()
+        threading.Timer(CAPTURE_TIMEOUT, _unlock_if_stuck).start()
+
     def poll():
         try:
             while True:
@@ -554,6 +594,8 @@ def run_gui(registry):
                     render_results(root, status, frame, fonts, [], err=msg[1])
         except queue.Empty:
             pass
+        except Exception:
+            pass   # 渲染出错也不能中断 poll，否则界面会卡死、看起来像没反应
         root.after(100, poll)
 
     try:

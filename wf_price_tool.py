@@ -27,6 +27,8 @@ HOTKEY = "f9"                        # 触发热键（单个键名，如 f9 / f1
 PROXY = None                         # 默认直连；若需代理填 "http://127.0.0.1:7890"
 MONITOR = 1                          # 截图的显示器编号（1 = 主屏）
 MATCH_CUTOFF = 85                    # 道具名匹配阈值（0-100，越高越严格）
+OCR_REFINE = True                    # 对每个文本框裁剪后二次识别，提高小字准确率
+GOLD_FILTER = True                   # 只把金黄色文字当道具名（过滤玩家名等干扰）
 PRICE_TIMEOUT = 8                    # 查价请求超时（秒）
 CAPTURE_TIMEOUT = 30                 # 单次识别看门狗超时（秒），卡住时强制解锁热键
 DIRECT_TIMEOUT = 5                   # 直连探测超时（秒），失败后回退本地代理
@@ -201,20 +203,28 @@ class ItemRegistry:
         return item2relic
 
     # ---- 匹配 ----
-    def match(self, text, cutoff=MATCH_CUTOFF):
+    def match_best(self, texts, cutoff=MATCH_CUTOFF):
+        """对一组候选文本（如换行合并的全名 + 各单行）逐一匹配，
+        返回 (得分最高的道具, 得分)；得分低于 cutoff 返回 (None, 得分)。"""
         from rapidfuzz import fuzz
-        tn = self.norm(text)
-        if not tn:
-            return None
-        idx = self._norm_map.get(tn)
-        if idx is not None:
-            return self.items[idx]
         best, best_score = None, 0.0
-        for i, name in enumerate(self.norm_list):
-            score = fuzz.ratio(tn, name)
-            if score > best_score:
-                best_score, best = score, self.items[i]
-        return best if best_score >= cutoff else None
+        for text in texts:
+            tn = self.norm(text)
+            if not tn:
+                continue
+            idx = self._norm_map.get(tn)
+            if idx is not None:
+                return self.items[idx], 100.0
+            for i, name in enumerate(self.norm_list):
+                score = fuzz.ratio(tn, name)
+                if score > best_score:
+                    best_score, best = score, self.items[i]
+        if best_score < cutoff:
+            return None, best_score
+        return best, best_score
+
+    def match(self, text, cutoff=MATCH_CUTOFF):
+        return self.match_best([text], cutoff)[0]
 
     # ---- 入库/出库判定 ----
     def vaulted_status(self, item):
@@ -300,16 +310,162 @@ _OCR_ENGINE = None
 _OCR_LOCK = threading.Lock()        # OCR 引擎非线程安全，识别线程可能并发，需加锁
 
 
-def ocr_image(img):
-    from rapidocr_onnxruntime import RapidOCR
+def _get_ocr_engine():
     global _OCR_ENGINE
+    from rapidocr_onnxruntime import RapidOCR
+    if _OCR_ENGINE is None:
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
+
+
+def ocr_image(img):
     with _OCR_LOCK:
-        if _OCR_ENGINE is None:
-            _OCR_ENGINE = RapidOCR()
-        result, _ = _OCR_ENGINE(img)
+        engine = _get_ocr_engine()
+        result, _ = engine(img)
     if not result:
         return []
-    return [(box, text, float(score)) for box, text, score in result]
+    lines = [(item[0], str(item[1]), float(item[2])) for item in result]
+    if OCR_REFINE:
+        lines = refine_ocr(img, lines)
+    return lines
+
+
+def refine_ocr(img, lines):
+    """二次识别：把整图识别出的每个文本框带边距裁剪出来单独再识别一遍。
+    整图识别时小字（如长道具名）容易被压缩降采样导致误读，
+    单框识别分辨率更高，准确率明显提升；取两次中置信度高的结果。"""
+    h_img, w_img = img.shape[:2]
+    refined = []
+    with _OCR_LOCK:
+        engine = _get_ocr_engine()
+        for box, text, score in lines:
+            try:
+                xs = [p[0] for p in box]
+                ys = [p[1] for p in box]
+                x0, x1 = int(min(xs)), int(max(xs))
+                y0, y1 = int(min(ys)), int(max(ys))
+                pad = max(2, int((y1 - y0) * 0.3))
+                crop = img[max(0, y0 - pad):min(h_img, y1 + pad),
+                           max(0, x0 - pad):min(w_img, x1 + pad)]
+                if crop.size:
+                    res, _ = engine(crop, use_det=False, use_cls=False, use_rec=True)
+                    if res:
+                        r0 = res[0]
+                        if len(r0) == 2:            # [text, score]
+                            t2, s2 = str(r0[0]), float(r0[1])
+                        elif len(r0) >= 3:          # [box, text, score]
+                            t2, s2 = str(r0[1]), float(r0[2])
+                        else:
+                            t2, s2 = None, 0.0
+                        if t2 and s2 >= score:
+                            text, score = t2, s2
+            except Exception:
+                pass                                # 二次识别失败就沿用整图结果
+            refined.append((box, text, score))
+    return refined
+
+
+def _bbox_of(box):
+    xs = [float(p[0]) for p in box]
+    ys = [float(p[1]) for p in box]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _is_gold_text(img, bbox):
+    """判断文字框是否为金黄色（报酬界面道具名的专用颜色）。
+    返回 True/False；无法判断（裁剪失败、太暗等）时返回 None。"""
+    try:
+        import cv2
+        import numpy as np
+        x0, y0, x1, y1 = bbox
+        h, w = img.shape[:2]
+        x0, y0, x1, y1 = max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        hsv = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        bright = hsv[:, :, 2] >= 140                # 文字比暗背景亮得多
+        if int(bright.sum()) < 8:
+            return None
+        hue = float(np.median(hsv[:, :, 0][bright]))
+        sat = float(np.median(hsv[:, :, 1][bright]))
+        return 12 <= hue <= 40 and sat >= 60        # 金黄色（约 #c8a951）
+    except Exception:
+        return None
+
+
+def group_name_lines(lines, img):
+    """把同一个道具名被 OCR 拆开的多行合并成一组，返回 [[entry, ...], ...]。
+
+    报酬界面（金名，单行卡片）与交易站（白名，多列网格）都适用：
+    1) 按 x 区间把较窄的文字框聚类成「列」，超宽框（标题栏等）不参与，避免跨列串并；
+    2) 列内按 y 排序，仅合并纵向相邻（折行）、横向居中、且不是「金+白」混排的行——
+       这样既能在网格里把同列折行拼成全名，又能保留「金色道具名不并入白色玩家名」。"""
+    entries = []
+    for box, text, score in lines:
+        x0, y0, x1, y1 = _bbox_of(box)
+        entries.append({"text": text, "score": score, "bbox": (x0, y0, x1, y1),
+                        "gold": _is_gold_text(img, (x0, y0, x1, y1)),
+                        "w": x1 - x0})
+    img_w = img.shape[1]
+    max_col_w = img_w * 0.5                       # 超过半幅视为标题等宽框，单列隔离
+    narrow = [e for e in entries if e["w"] <= max_col_w]
+    wide = [e for e in entries if e["w"] > max_col_w]
+
+    narrow.sort(key=lambda e: e["bbox"][0])
+    cols = []
+    for e in narrow:
+        placed = False
+        for col in cols:
+            if e["bbox"][0] <= col["x1"] + 20:     # x 区间重叠（含小间隙容差）
+                col["x0"] = min(col["x0"], e["bbox"][0])
+                col["x1"] = max(col["x1"], e["bbox"][1])
+                col["members"].append(e)
+                placed = True
+                break
+        if not placed:
+            cols.append({"x0": e["bbox"][0], "x1": e["bbox"][1], "members": [e]})
+
+    groups = []
+    for col in cols:
+        col["members"].sort(key=lambda e: e["bbox"][1])
+        groups.extend(_merge_column(col["members"]))
+    for e in wide:                                 # 宽框各自成组，不参与合并
+        groups.append([e])
+    return groups
+
+
+def _merge_column(members):
+    """列内纵向合并：仅合并紧邻（折行）、横向居中、且非金白混排的相邻行。"""
+    used = [False] * len(members)
+    groups = []
+    for i, a in enumerate(members):
+        if used[i]:
+            continue
+        used[i] = True
+        group = [a]
+        ax0, ay0, ax1, ay1 = a["bbox"]
+        for j in range(i + 1, len(members)):
+            if used[j]:
+                continue
+            b = members[j]
+            # 金名（道具）绝不并入白名（玩家名/网格白字干扰），但白+白、金+金允许
+            if (a["gold"] is True and b["gold"] is False) or \
+               (a["gold"] is False and b["gold"] is True):
+                continue
+            bx0, by0, bx1, by1 = b["bbox"]
+            lh = max(ay1 - ay0, 1.0)
+            gap = by0 - ay1
+            if gap < -lh * 0.3 or gap > lh * 1.2:  # 必须紧跟在下方、且不是另一行
+                continue
+            bcx = (bx0 + bx1) / 2
+            if bcx < ax0 - lh or bcx > ax1 + lh:   # 横向须落在第一行范围内
+                continue
+            group.append(b)
+            used[j] = True
+            ax0, ay0 = min(ax0, bx0), min(ay0, by0)
+            ax1, ay1 = max(ax1, bx1), max(ay1, by1)
+        groups.append(group)
+    return groups
 
 
 # ---------------------------------------------------------------- 预热
@@ -333,13 +489,25 @@ def identify_items(registry, image=None):
     """截图 + OCR + 匹配，返回识别出的道具 [{slug, zh, en}]。"""
     img = image if image is not None else capture_screen()
     lines = ocr_image(img)
-    seen, items = set(), []
-    for _, text, _ in lines:
-        it = registry.match(text)
-        if it and it["slug"] not in seen:
-            seen.add(it["slug"])
-            items.append(it)
-    return items
+    groups = group_name_lines(lines, img)
+    # 优先只用含道具名色的组（金色屏幕的金名；过滤白色玩家名等干扰），
+    # 没有任何这类组（如白字密集表格界面）时回退到全部文字（每行独立匹配）。
+    gold_groups = [g for g in groups if any(e["gold"] is not False for e in g)]
+    attempts = ([gold_groups, groups]
+                if (GOLD_FILTER and gold_groups) else [groups])
+    for cand_groups in attempts:
+        seen, items = set(), []
+        for group in cand_groups:
+            texts = [e["text"] for e in group]
+            if len(texts) > 1:
+                texts = ["".join(texts)] + texts   # 合并后的全名优先，单行兜底
+            it, _ = registry.match_best(texts)
+            if it and it["slug"] not in seen:
+                seen.add(it["slug"])
+                items.append(it)
+        if items:
+            return items
+    return []
 
 
 def fetch_fresh_prices(items):

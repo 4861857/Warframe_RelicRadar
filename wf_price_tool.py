@@ -141,17 +141,27 @@ class ItemRegistry:
 
     # ---- 加载 / 下载 ----
     def load(self, force_refresh=False):
-        if not force_refresh and os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                self.items = json.load(f)
+        need_items = force_refresh or not os.path.exists(CACHE_FILE)
+        need_relic = force_refresh or not os.path.exists(RELIC_FILE)
+        if need_items and need_relic:
+            # 两份缓存都缺失时并行下载，冷启动省一半时间
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=2) as ex:
+                f_items = ex.submit(self._download_items)
+                f_relic = ex.submit(self._download_relic_drops)
+                self.items = f_items.result()
+                self.item2relic = f_relic.result()
         else:
-            self.items = self._download_items()
-
-        if not force_refresh and os.path.exists(RELIC_FILE):
-            with open(RELIC_FILE, "r", encoding="utf-8") as f:
-                self.item2relic = json.load(f)
-        else:
-            self.item2relic = self._download_relic_drops()
+            if need_items:
+                self.items = self._download_items()
+            else:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    self.items = json.load(f)
+            if need_relic:
+                self.item2relic = self._download_relic_drops()
+            else:
+                with open(RELIC_FILE, "r", encoding="utf-8") as f:
+                    self.item2relic = json.load(f)
 
         self.norm_list = [self.norm(it["zh"]) for it in self.items]
         self._norm_map = {n: i for i, n in enumerate(self.norm_list)}
@@ -321,7 +331,7 @@ def _get_ocr_engine():
 def ocr_image(img):
     with _OCR_LOCK:
         engine = _get_ocr_engine()
-        result, _ = engine(img)
+        result, _ = engine(img, use_cls=False)   # 中文横排无需方向分类，省时
     if not result:
         return []
     lines = [(item[0], str(item[1]), float(item[2])) for item in result]
@@ -331,38 +341,43 @@ def ocr_image(img):
 
 
 def refine_ocr(img, lines):
-    """二次识别：把整图识别出的每个文本框带边距裁剪出来单独再识别一遍。
-    整图识别时小字（如长道具名）容易被压缩降采样导致误读，
-    单框识别分辨率更高，准确率明显提升；取两次中置信度高的结果。"""
+    """二次识别：把整图识别出的文本框带边距裁剪出来，一次性批量再识别一遍。
+    整图识别时小字（如长道具名）会被 det 阶段降采样，单框用原图分辨率重识别更准。
+    逐框调用识别引擎开销极大（每次都有流水线初始化，48 框约 35s），
+    这里把所有裁剪框拼成一个批次用 text_recognizer 一次前向完成（48 框约 2s）。
+    最后取两次中置信度高的结果；批量失败则整体沿用整图结果。"""
     h_img, w_img = img.shape[:2]
-    refined = []
+    crops, idxs, scores0 = [], [], []
+    for k, (box, _text, score) in enumerate(lines):
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        x0, x1 = int(min(xs)), int(max(xs))
+        y0, y1 = int(min(ys)), int(max(ys))
+        pad = max(2, int((y1 - y0) * 0.3))
+        crop = img[max(0, y0 - pad):min(h_img, y1 + pad),
+                   max(0, x0 - pad):min(w_img, x1 + pad)]
+        if crop.size:
+            crops.append(crop)
+            idxs.append(k)
+            scores0.append(score)
+    if not crops:
+        return list(lines)
     with _OCR_LOCK:
         engine = _get_ocr_engine()
-        for box, text, score in lines:
-            try:
-                xs = [p[0] for p in box]
-                ys = [p[1] for p in box]
-                x0, x1 = int(min(xs)), int(max(xs))
-                y0, y1 = int(min(ys)), int(max(ys))
-                pad = max(2, int((y1 - y0) * 0.3))
-                crop = img[max(0, y0 - pad):min(h_img, y1 + pad),
-                           max(0, x0 - pad):min(w_img, x1 + pad)]
-                if crop.size:
-                    res, _ = engine(crop, use_det=False, use_cls=False, use_rec=True)
-                    if res:
-                        r0 = res[0]
-                        if len(r0) == 2:            # [text, score]
-                            t2, s2 = str(r0[0]), float(r0[1])
-                        elif len(r0) >= 3:          # [box, text, score]
-                            t2, s2 = str(r0[1]), float(r0[2])
-                        else:
-                            t2, s2 = None, 0.0
-                        if t2 and s2 >= score:
-                            text, score = t2, s2
-            except Exception:
-                pass                                # 二次识别失败就沿用整图结果
-            refined.append((box, text, score))
-    return refined
+        try:
+            rec_res, _ = engine.text_recognizer(crops)
+        except Exception:
+            return list(lines)                       # 批量识别失败就沿用整图结果
+    out = list(lines)
+    for i, k in enumerate(idxs):
+        try:
+            t2, s2 = str(rec_res[i][0]), float(rec_res[i][1])
+        except Exception:
+            continue
+        if t2 and s2 >= scores0[i]:
+            box = lines[k][0]
+            out[k] = (box, t2, s2)
+    return out
 
 
 def _bbox_of(box):

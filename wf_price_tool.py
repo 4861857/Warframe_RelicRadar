@@ -35,6 +35,12 @@ DIRECT_TIMEOUT = 5                   # 直连探测超时（秒），失败后�
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "item_names.json")
 RELIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relic_drops.json")
 PRICE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "price_cache.json")
+STATS_ENABLED = True                 # 是否抓取并显示每个物品 48h 销量/均价（低优先级、易超时即跳过）
+STATS_TIMEOUT = 8                    # 统计接口单次请求超时（秒），超时即放弃该物品
+STATS_MAX_AGE = 3600                 # 统计缓存有效期（秒），过期才重新抓取
+STATS_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats_cache.json")
+STATS_API_BASE = "https://api.warframe.market/v1"   # 统计接口仅在 v1 提供（v2 返回 404）
+STATS_FAILED = {"timeout": True}                      # 哨兵：已尝试抓取但失败（超时/错误）
 API_BASE = "https://api.warframe.market/v2"
 # 遗物掉落表（item -> 来源遗物）来源：WFCD/warframe-drop-data
 DROP_DATA_URL = ("https://raw.githubusercontent.com/WFCD/warframe-drop-data/"
@@ -77,8 +83,9 @@ _PREFERRED_PROXY = _UNSET
 MAX_RETRIES = 3                      # 瞬时网络错误（连接重置/超时）的重试次数
 
 
-def urlopen_json(url, timeout=PRICE_TIMEOUT):
-    """请求 JSON。默认直连；失败后自动回退到系统代理（并记住）。"""
+def urlopen_json(url, timeout=PRICE_TIMEOUT, retries=MAX_RETRIES):
+    """请求 JSON。默认直连；失败后自动回退到系统代理（并记住）。
+    retries 控制单通道内重试次数（统计接口用 0 避免超时叠加）。"""
     global _PREFERRED_PROXY
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -102,7 +109,7 @@ def urlopen_json(url, timeout=PRICE_TIMEOUT):
     for p in candidates:
         opener = _make_opener(p)
         t = DIRECT_TIMEOUT if (p is None and PROXY is None and len(candidates) > 1) else timeout
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(retries):
             req = urllib.request.Request(url, headers=headers)
             try:
                 with opener.open(req, timeout=t) as r:
@@ -111,7 +118,7 @@ def urlopen_json(url, timeout=PRICE_TIMEOUT):
                 return data
             except urllib.error.HTTPError as e:
                 # 5xx / 限流才值得重试；其余 HTTP 错误放弃该通道
-                if e.code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES - 1:
+                if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                     last = e
                     time.sleep(0.6 * (attempt + 1))
                     continue
@@ -120,7 +127,7 @@ def urlopen_json(url, timeout=PRICE_TIMEOUT):
             except Exception as e:
                 # 连接重置(10054)、超时等瞬时错误：换新连接重试
                 last = e
-                if attempt < MAX_RETRIES - 1:
+                if attempt < retries - 1:
                     time.sleep(0.6 * (attempt + 1))
                     continue
     raise last
@@ -303,6 +310,92 @@ class PriceCache:
                 json.dump(self.data, f, ensure_ascii=False)
         except Exception:
             pass
+
+
+class StatsCache:
+    """48h 销量/均价缓存：与主流程解耦，抓取失败/超时不影响识别与查价。"""
+    def __init__(self, path, max_age=STATS_MAX_AGE):
+        self.path = path
+        self.max_age = max_age
+        self.data = {}
+        self.load()
+
+    def load(self):
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+        except Exception:
+            self.data = {}
+
+    def get(self, slug):
+        v = self.data.get(slug)
+        if v and (time.time() - v.get("ts", 0)) < self.max_age:
+            return v                       # {"volume_48h", "avg_48h", "ts"}
+        return None                        # 过期或缺失：当作需要重新抓取
+
+    def put(self, slug, stat):
+        self.data[slug] = stat
+
+    def update(self, stats):
+        now = time.time()
+        for slug, s in stats.items():
+            if s:
+                s = dict(s); s["ts"] = now
+                self.data[slug] = s
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def _summarize_48h(data):
+    """从统计接口响应里算出 48h 总销量与成交量加权均价。"""
+    try:
+        arr = (data.get("payload", {}).get("statistics_closed", {}).get("48hours")) or []
+        if not arr:
+            return None
+        total_vol = 0
+        weighted = 0.0
+        for e in arr:
+            v = e.get("volume") or 0
+            price = e.get("wa_price") if e.get("wa_price") is not None else e.get("avg_price")
+            total_vol += v
+            if price is not None:
+                weighted += price * v
+        if total_vol <= 0:
+            return None
+        return {"volume_48h": total_vol, "avg_48h": weighted / total_vol}
+    except Exception:
+        return None
+
+
+def fetch_item_statistics(slug):
+    """抓取单个物品的 48h 统计；任何失败（含超时）都返回 None，绝不抛错。"""
+    try:
+        data = urlopen_json(f"{STATS_API_BASE}/items/{slug}/statistics",
+                            timeout=STATS_TIMEOUT, retries=1)   # 单次尝试，短超时
+        return _summarize_48h(data)
+    except Exception:
+        return None
+
+
+def fetch_stats_for_items(items):
+    """并行抓取多个物品的统计，返回 {slug: 统计}；失败/超时项直接跳过。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def f(it):
+        return it["slug"], fetch_item_statistics(it["slug"])
+
+    out = {}
+    if items:
+        n = min(len(items), 8)
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            for slug, st in ex.map(f, items):
+                if st is not None:
+                    out[slug] = st
+    return out
 
 
 # ---------------------------------------------------------------- 截图 + OCR
@@ -544,27 +637,56 @@ def fetch_fresh_prices(items):
     return prices
 
 
-def build_results(registry, items, prices):
-    """items + 价格字典 {slug:{low,high[,ts]}} -> 结果列表。"""
+def build_results(registry, items, prices, stats=None):
+    """items + 价格字典 {slug:{low,high[,ts]}} -> 结果列表。
+    stats 为可选字典 {slug: {volume_48h, avg_48h, ts} / STATS_FAILED / None}。
+    STATS_FAILED 表示已尝试抓取但失败（超时），None 表示尚未抓取（加载中）。"""
     results = []
     for it in items:
         p = prices.get(it["slug"])
+        s = (stats or {}).get(it["slug"])
+        if isinstance(s, dict) and "timeout" not in s:
+            vol, avg, timeout = s.get("volume_48h"), s.get("avg_48h"), False
+        else:
+            vol, avg, timeout = None, None, bool(isinstance(s, dict) and s.get("timeout"))
         results.append({
             "zh": it["zh"], "en": it["en"], "slug": it["slug"],
             "low_sell": p["low"] if p else None,
             "high_buy": p["high"] if p else None,
             "cache_ts": p.get("ts") if p else None,   # 缓存价的时间戳（无则 None）
             "vaulted": registry.vaulted_status(it),
+            "vol_48h": vol,
+            "avg_48h": avg,
+            "stats_timeout": timeout,
         })
     return results
 
 
 def process_once(registry, image=None):
-    """一次性：识别 + 查价（--image 模式用，无缓存）。"""
+    """一次性：识别 + 查价（--image 模式用，无缓存）。
+    统计（48h 销量/均价）为低优先级增强：仅抓取未缓存项、并行、短超时，
+    失败即跳过，不会拖慢主识别流程。"""
     items = identify_items(registry, image)
     if not items:
         return []
-    return build_results(registry, items, fetch_fresh_prices(items))
+    prices = fetch_fresh_prices(items)
+    stats = None
+    if STATS_ENABLED:
+        sc = StatsCache(STATS_CACHE_FILE)
+        miss = [it for it in items if sc.get(it["slug"]) is None]
+        if miss:
+            sc.update(fetch_stats_for_items(miss))
+        attempted = {it["slug"] for it in miss}
+        stats = {}
+        for it in items:
+            s = sc.get(it["slug"])
+            if s:
+                stats[it["slug"]] = s
+            elif it["slug"] in attempted:
+                stats[it["slug"]] = STATS_FAILED          # 抓过但失败
+            else:
+                stats[it["slug"]] = None
+    return build_results(registry, items, prices, stats)
 
 
 # ---------------------------------------------------------------- GUI
@@ -706,6 +828,17 @@ def render_results(root, status, frame, fonts, results, err=None, status_text=No
                  bg="#1e2229", fg="#3ab0d8" if high is not None else "#5a616b",
                  font=f_price).pack(side="left", padx=(18, 0))
 
+        vol, avg = r.get("vol_48h"), r.get("avg_48h")
+        if vol is not None:
+            stext = f"48h 销量 {vol}"
+            if avg is not None:
+                stext += f" · 均价 {avg:.1f} 白金"
+            tk.Label(bot, text=stext, bg="#1e2229", fg="#9aa3ad",
+                     font=f_sub).pack(side="left", padx=(18, 0))
+        elif r.get("stats_timeout"):
+            tk.Label(bot, text="48h 统计超时", bg="#1e2229", fg="#e05c5c",
+                     font=f_sub).pack(side="left", padx=(18, 0))
+
         age = _fmt_age(r.get("cache_ts"))
         if age:
             tk.Label(bot, text=f"缓存·{age}", bg="#1e2229", fg="#5a616b",
@@ -721,6 +854,8 @@ def run_gui(registry):
     threading.Thread(target=warmup, daemon=True).start()
 
     price_cache = PriceCache(PRICE_CACHE_FILE)
+    stats_cache = StatsCache(STATS_CACHE_FILE)
+    run_gen = {"n": 0}                     # 每次识别自增，旧的后台线程据此放弃渲染
 
     q = queue.Queue()
     busy = threading.Event()
@@ -728,21 +863,57 @@ def run_gui(registry):
     def capture_worker():
         # 重活（截图/OCR/查价）放在独立线程里做，绝不占用 keyboard 的监听线程。
         try:
+            gen = run_gen["n"]                  # 在开头捕获，用于后台统计线程判断是否被新一轮取代
             items = identify_items(registry)
             if not items:
                 q.put(("result", [], "未识别到道具，请确认画面停留在报酬界面"))
                 return
 
-            # 1) 先用缓存价立即显示
+            # 1) 先用缓存价 + 缓存统计立即显示（不联网）
             cached = {it["slug"]: price_cache.get(it["slug"]) for it in items}
-            q.put(("result", build_results(registry, items, cached),
+            st_cached = {it["slug"]: stats_cache.get(it["slug"]) for it in items}
+            q.put(("result", build_results(registry, items, cached, st_cached),
                    f"识别完成 · {len(items)} 件 · 显示缓存价，更新中…"))
 
-            # 2) 后台刷新最新价，刷新显示并写入缓存
+            # 2) 刷新最新价（主流程，优先级最高），刷新显示并写缓存
             fresh = fetch_fresh_prices(items)
             price_cache.update(fresh)
-            q.put(("result", build_results(registry, items, fresh),
+            q.put(("result", build_results(registry, items, fresh, st_cached),
                    f"识别完成 · {len(items)} 件 · 已更新 · 按 {HOTKEY.upper()} 重试"))
+
+            # 3) 48h 销量/均价：最低优先级，独立后台线程抓取，
+            #    超时/失败即跳过，且不影响 busy 解锁与下次 F9。
+            if STATS_ENABLED:
+                gen = run_gen["n"]
+                miss = [it for it in items if stats_cache.get(it["slug"]) is None]
+                if miss:
+                    def _stats_worker():
+                        try:
+                            new_stats = fetch_stats_for_items(miss)
+                            if new_stats:
+                                stats_cache.update(new_stats)
+                            if gen != run_gen["n"]:      # 已被新一次识别取代
+                                return
+                            attempted = {it["slug"] for it in miss}
+                            st_final = {}
+                            for it in items:
+                                s = stats_cache.get(it["slug"])
+                                if s:
+                                    st_final[it["slug"]] = s
+                                elif it["slug"] in attempted:
+                                    st_final[it["slug"]] = STATS_FAILED   # 抓过但失败
+                                else:
+                                    st_final[it["slug"]] = None
+                            status_text = (
+                                f"识别完成 · {len(items)} 件 · 含48h统计 · 按 {HOTKEY.upper()} 重试"
+                                if new_stats else
+                                f"识别完成 · {len(items)} 件 · 已更新 · 按 {HOTKEY.upper()} 重试")
+                            q.put(("result",
+                                   build_results(registry, items, fresh, st_final),
+                                   status_text))
+                        except Exception:
+                            pass
+                    threading.Thread(target=_stats_worker, daemon=True).start()
         except Exception as e:
             q.put(("error", f"出错: {e}"))
         finally:
@@ -760,6 +931,7 @@ def run_gui(registry):
         if busy.is_set():
             return
         busy.set()
+        run_gen["n"] += 1                     # 标记新一轮，使上一轮残留的后台统计线程放弃渲染
         q.put(("status", "识别中..."))
         threading.Thread(target=capture_worker, daemon=True).start()
         threading.Timer(CAPTURE_TIMEOUT, _unlock_if_stuck).start()
@@ -815,6 +987,14 @@ def main():
             badge, _ = _vaulted_label(r["vaulted"])
             print(f"{r['zh']}  ({r['en']})  [{badge}]")
             print(f"    卖家最低: {low} 白金 | 买家最高: {high} 白金")
+            vol, avg = r.get("vol_48h"), r.get("avg_48h")
+            if vol is not None:
+                s = f"    48h 销量: {vol}"
+                if avg is not None:
+                    s += f" | 均价: {avg:.1f} 白金"
+                print(s)
+            elif r.get("stats_timeout"):
+                print("    48h 统计: 超时")
         return
 
     if refresh:

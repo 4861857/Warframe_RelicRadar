@@ -68,8 +68,9 @@ python wf_price_tool.py --refresh             # 重新下载两份缓存
 - **识别不到道具**：确认画面停留在报酬界面、道具名清晰无遮挡；可先用 `--image` 对截图试跑排查。
 
 ## 效果截图
-<img width="2557" height="1440" alt="image" src="https://github.com/user-attachments/assets/2c83ef68-6821-4f80-b39e-579c249da0df" />
-<img width="912" height="631" alt="image" src="https://github.com/user-attachments/assets/29756a1a-7a16-41ed-9089-0d60db0d9c8f" />
+<img width="1080" height="528" alt="Snipaste_2026-10-26_23-51-43" src="https://github.com/user-attachments/assets/dd77d963-1b1f-47ad-8287-2327a8de389b" />
+<img width="1080" height="1711" alt="Snipaste_2026-10-26_23-57-47" src="https://github.com/user-attachments/assets/2baae03a-a885-486c-b938-51e2d56a3ed8" />
+<img width="2560" height="1440" alt="Snipaste_2026-10-26_23-58-08" src="https://github.com/user-attachments/assets/789493b1-333a-47c9-a6dd-d80e36c2384c" />
 
 
 

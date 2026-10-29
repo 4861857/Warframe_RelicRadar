@@ -32,13 +32,19 @@ GOLD_FILTER = True                   # 只把金黄色文字当道具名（过�
 PRICE_TIMEOUT = 8                    # 查价请求超时（秒）
 CAPTURE_TIMEOUT = 30                 # 单次识别看门狗超时（秒），卡住时强制解锁热键
 DIRECT_TIMEOUT = 5                   # 直连探测超时（秒），失败后回退本地代理
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "item_names.json")
-RELIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relic_drops.json")
-PRICE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "price_cache.json")
+# 缓存目录：打包成 exe 后改用 exe 所在目录，否则缓存会被写进临时解压目录（每次运行都重建、退出即丢失）
+if getattr(sys, "frozen", False):
+    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CACHE_FILE = os.path.join(_APP_DIR, "item_names.json")
+RELIC_FILE = os.path.join(_APP_DIR, "relic_drops.json")
+PRICE_CACHE_FILE = os.path.join(_APP_DIR, "price_cache.json")
 STATS_ENABLED = True                 # 是否抓取并显示每个物品 48h 销量/均价（低优先级、易超时即跳过）
 STATS_TIMEOUT = 8                    # 统计接口单次请求超时（秒），超时即放弃该物品
 STATS_MAX_AGE = 3600                 # 统计缓存有效期（秒），过期才重新抓取
-STATS_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats_cache.json")
+STATS_CACHE_FILE = os.path.join(_APP_DIR, "stats_cache.json")
 STATS_API_BASE = "https://api.warframe.market/v1"   # 统计接口仅在 v1 提供（v2 返回 404）
 STATS_FAILED = {"timeout": True}                      # 哨兵：已尝试抓取但失败（超时/错误）
 API_BASE = "https://api.warframe.market/v2"
@@ -47,7 +53,7 @@ DROP_DATA_URL = ("https://raw.githubusercontent.com/WFCD/warframe-drop-data/"
                  "master/data/relics.json")
 # =================================================
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = _APP_DIR
 
 
 # ---------------------------------------------------------------- 网络层
@@ -62,8 +68,11 @@ def _registry_proxy():
             v, _ = winreg.QueryValueEx(k, "ProxyServer")
         finally:
             winreg.CloseKey(k)
-        if isinstance(v, str) and v and "=" not in v and v.startswith("http"):
-            return v
+        if isinstance(v, str) and v and "=" not in v:
+            # 注册表格式为 host:port，补充 scheme；已带 scheme 的直接用
+            if v.startswith("http"):
+                return v
+            return f"http://{v}"
     except Exception:
         pass
     return None
@@ -85,7 +94,7 @@ MAX_RETRIES = 3                      # 瞬时网络错误（连接重置/超时�
 
 def urlopen_json(url, timeout=PRICE_TIMEOUT, retries=MAX_RETRIES):
     """请求 JSON。默认直连；失败后自动回退到系统代理（并记住）。
-    retries 控制单通道内重试次数（统计接口用 0 避免超时叠加）。"""
+    retries 控制单通道内重试次数（统计接口用 1，单次尝试避免超时叠加）。"""
     global _PREFERRED_PROXY
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -105,7 +114,9 @@ def urlopen_json(url, timeout=PRICE_TIMEOUT, retries=MAX_RETRIES):
             if rp:
                 candidates.append(rp)          # 直连失败后兜底用系统代理
 
-    last = None
+    last = RuntimeError(f"请求失败: {url}")
+    if retries < 1:
+        retries = 1
     for p in candidates:
         opener = _make_opener(p)
         t = DIRECT_TIMEOUT if (p is None and PROXY is None and len(candidates) > 1) else timeout
@@ -141,6 +152,7 @@ class ItemRegistry:
         self._norm_map = {}
         self.relic_vaulted = {}   # relic slug -> bool
         self.item2relic = {}      # item 英文名 -> [遗物全名]
+        self._vault_cache = {}   # 英文名 -> 入库状态（模糊匹配开销大，结果做记忆化）
 
     @staticmethod
     def norm(s):
@@ -171,7 +183,10 @@ class ItemRegistry:
                     self.item2relic = json.load(f)
 
         self.norm_list = [self.norm(it["zh"]) for it in self.items]
-        self._norm_map = {n: i for i, n in enumerate(self.norm_list)}
+        # 重名道具保留先出现者，避免后项覆盖前项导致精确匹配命错
+        self._norm_map = {}
+        for i, n in enumerate(self.norm_list):
+            self._norm_map.setdefault(n, i)
         self.relic_vaulted = {
             it["slug"]: it["vaulted"]
             for it in self.items
@@ -223,7 +238,7 @@ class ItemRegistry:
     def match_best(self, texts, cutoff=MATCH_CUTOFF):
         """对一组候选文本（如换行合并的全名 + 各单行）逐一匹配，
         返回 (得分最高的道具, 得分)；得分低于 cutoff 返回 (None, 得分)。"""
-        from rapidfuzz import fuzz
+        from rapidfuzz import fuzz, process
         best, best_score = None, 0.0
         for text in texts:
             tn = self.norm(text)
@@ -232,10 +247,13 @@ class ItemRegistry:
             idx = self._norm_map.get(tn)
             if idx is not None:
                 return self.items[idx], 100.0
-            for i, name in enumerate(self.norm_list):
-                score = fuzz.ratio(tn, name)
+            # 暴力全扫数千道具太慢，用 process.extractOne（C++ 实现）
+            m = process.extractOne(tn, self.norm_list, scorer=fuzz.ratio,
+                                   score_cutoff=cutoff) if self.norm_list else None
+            if m:
+                _, score, i = m
                 if score > best_score:
-                    best_score, best = score, self.items[i]
+                    best, best_score = self.items[i], score
         if best_score < cutoff:
             return None, best_score
         return best, best_score
@@ -245,9 +263,17 @@ class ItemRegistry:
 
     # ---- 入库/出库判定 ----
     def vaulted_status(self, item):
-        """返回 True=入库, False=出库, None=未知。"""
-        from rapidfuzz import fuzz
+        """返回 True=入库, False=出库, None=未知。
+        对 drop-data 英文名做模糊匹配开销大，结果按英文名记忆化缓存。"""
         en = item.get("en", "")
+        if en in self._vault_cache:
+            return self._vault_cache[en]
+        result = self._vault_status_uncached(item, en)
+        self._vault_cache[en] = result
+        return result
+
+    def _vault_status_uncached(self, item, en):
+        from rapidfuzz import fuzz
         relics = self.item2relic.get(en)
         if relics is None and en:            # 名字可能略有差异，做一次模糊匹配
             best, best_score = None, 0.0
@@ -284,9 +310,11 @@ def get_item_price(slug):
 
 
 class PriceCache:
-    """价格缓存：识别后先显示上次缓存价，后台刷新后再更新。"""
+    """价格缓存：识别后先显示上次缓存价，后台刷新后再更新。
+    GUI 后台线程可能并发调用 update，需加锁保护内存字典与文件写入。"""
     def __init__(self, path):
         self.path = path
+        self._lock = threading.Lock()
         self.data = {}
         self.load()
 
@@ -299,24 +327,33 @@ class PriceCache:
             self.data = {}
 
     def get(self, slug):
-        return self.data.get(slug)          # {"low":..., "high":..., "ts":...}
+        with self._lock:
+            return self.data.get(slug)       # {"low":..., "high":..., "ts":...}
 
     def update(self, prices):
         now = time.time()
-        for slug, p in prices.items():
-            self.data[slug] = {"low": p["low"], "high": p["high"], "ts": now}
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False)
-        except Exception:
-            pass
+        with self._lock:
+            for slug, p in prices.items():
+                self.data[slug] = {"low": p["low"], "high": p["high"], "ts": now}
+            # 清理超过 7 天未刷新的陈旧记录，防止缓存文件无限增长
+            stale = [k for k, v in self.data.items()
+                     if not isinstance(v, dict) or now - v.get("ts", 0) > 7 * 86400]
+            for k in stale:
+                del self.data[k]
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False)
+            except Exception:
+                pass
 
 
 class StatsCache:
-    """48h 销量/均价缓存：与主流程解耦，抓取失败/超时不影响识别与查价。"""
+    """48h 销量/均价缓存：与主流程解耦，抓取失败/超时不影响识别与查价。
+    主线程与后台统计线程可能并发读写，需加锁保护。"""
     def __init__(self, path, max_age=STATS_MAX_AGE):
         self.path = path
         self.max_age = max_age
+        self._lock = threading.Lock()
         self.data = {}
         self.load()
 
@@ -329,25 +366,24 @@ class StatsCache:
             self.data = {}
 
     def get(self, slug):
-        v = self.data.get(slug)
+        with self._lock:
+            v = self.data.get(slug)
         if v and (time.time() - v.get("ts", 0)) < self.max_age:
             return v                       # {"volume_48h", "avg_48h", "ts"}
         return None                        # 过期或缺失：当作需要重新抓取
 
-    def put(self, slug, stat):
-        self.data[slug] = stat
-
     def update(self, stats):
         now = time.time()
-        for slug, s in stats.items():
-            if s:
-                s = dict(s); s["ts"] = now
-                self.data[slug] = s
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False)
-        except Exception:
-            pass
+        with self._lock:
+            for slug, s in stats.items():
+                if s:
+                    s = dict(s); s["ts"] = now
+                    self.data[slug] = s
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False)
+            except Exception:
+                pass
 
 
 def _summarize_48h(data):
@@ -417,7 +453,9 @@ def _get_ocr_engine():
     global _OCR_ENGINE
     from rapidocr_onnxruntime import RapidOCR
     if _OCR_ENGINE is None:
-        _OCR_ENGINE = RapidOCR()
+        with _OCR_LOCK:                     # 双重检查，防止多线程重复建引擎
+            if _OCR_ENGINE is None:
+                _OCR_ENGINE = RapidOCR()
     return _OCR_ENGINE
 
 
@@ -526,12 +564,12 @@ def group_name_lines(lines, img):
         for col in cols:
             if e["bbox"][0] <= col["x1"] + 20:     # x 区间重叠（含小间隙容差）
                 col["x0"] = min(col["x0"], e["bbox"][0])
-                col["x1"] = max(col["x1"], e["bbox"][1])
+                col["x1"] = max(col["x1"], e["bbox"][2])
                 col["members"].append(e)
                 placed = True
                 break
         if not placed:
-            cols.append({"x0": e["bbox"][0], "x1": e["bbox"][1], "members": [e]})
+            cols.append({"x0": e["bbox"][0], "x1": e["bbox"][2], "members": [e]})
 
     groups = []
     for col in cols:
@@ -584,10 +622,7 @@ def warmup():
     except Exception:
         pass
     try:
-        global _OCR_ENGINE
-        from rapidocr_onnxruntime import RapidOCR
-        if _OCR_ENGINE is None:
-            _OCR_ENGINE = RapidOCR()
+        _get_ocr_engine()                    # 复用统一的懒初始化（内部已加锁）
     except Exception:
         pass
 
@@ -631,7 +666,8 @@ def fetch_fresh_prices(items):
 
     prices = {}
     if items:
-        with ThreadPoolExecutor(max_workers=len(items)) as ex:   # 并行查价
+        n = min(len(items), 8)                # 设并发上限，条目再多也不超 8 线程
+        with ThreadPoolExecutor(max_workers=n) as ex:
             for slug, p in ex.map(fetch, items):
                 prices[slug] = p
     return prices
@@ -704,7 +740,7 @@ def build_ui():
     f_name = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
     f_sub = tkfont.Font(family="Microsoft YaHei UI", size=18)
     f_price = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
-    f_badge = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
+    f_badge = f_price                     # 价格与入库标签字体相同，直接复用
 
     # 顶栏：状态文字 + 右上角图钉（切换是否置顶）
     topbar = tk.Frame(root, bg="#14161a")
@@ -850,41 +886,67 @@ def run_gui(registry):
     import tkinter as tk
     root, status, frame, fonts = build_ui()
 
+    ready = threading.Event()                 # 数据加载完成前，拒绝触发识别
+
+    run_gen = {"n": 0}                     # 每次识别自增，旧的后台线程据此放弃渲染
+    q = queue.Queue()
+    busy = threading.Event()
+    price_cache = PriceCache(PRICE_CACHE_FILE)
+    stats_cache = StatsCache(STATS_CACHE_FILE)
+
+    status.config(text="正在加载数据（首次需联网下载）…", fg="#8b93a1")
+
+    # 后台加载数据（首次会下载道具名单 + 遗物掉落表，可能需十几秒），不阻塞界面。
+    # Tk 控件只能在主线程操作，后台线程一律通过 q 发消息由 poll 渲染；
+    # 加载失败会自动重试，避免 F9 从此失效。
+    def _load():
+        while True:
+            try:
+                registry.load(force_refresh=False)
+                ready.set()
+                q.put(("status", f"就绪 · 按 {HOTKEY.upper()} 截图识别", "#6bc17b"))
+                return
+            except Exception as e:
+                q.put(("status", f"数据加载失败: {e}（30 秒后自动重试）", "#e05c5c"))
+                time.sleep(30)
+
+    threading.Thread(target=_load, daemon=True).start()
+
     # 后台预热：确定网络通道 + 加载 OCR 模型，减少首次按键延迟
     threading.Thread(target=warmup, daemon=True).start()
 
-    price_cache = PriceCache(PRICE_CACHE_FILE)
-    stats_cache = StatsCache(STATS_CACHE_FILE)
-    run_gen = {"n": 0}                     # 每次识别自增，旧的后台线程据此放弃渲染
-
-    q = queue.Queue()
-    busy = threading.Event()
-
     def capture_worker():
         # 重活（截图/OCR/查价）放在独立线程里做，绝不占用 keyboard 的监听线程。
+        gen = run_gen["n"]                  # 本轮代号；期间被新识别取代则放弃所有渲染与解锁
+
+        def _put(kind, *rest):
+            if gen == run_gen["n"]:         # 已被新一轮识别取代：旧结果不再渲染
+                q.put((kind,) + rest)
+
+        timer = threading.Timer(CAPTURE_TIMEOUT, _unlock_if_stuck, args=(gen,))
+        timer.daemon = True
+        timer.start()
         try:
-            gen = run_gen["n"]                  # 在开头捕获，用于后台统计线程判断是否被新一轮取代
             items = identify_items(registry)
             if not items:
-                q.put(("result", [], "未识别到道具，请确认画面停留在报酬界面"))
+                _put("result", [], "未识别到道具，请确认画面停留在报酬界面")
                 return
 
             # 1) 先用缓存价 + 缓存统计立即显示（不联网）
             cached = {it["slug"]: price_cache.get(it["slug"]) for it in items}
             st_cached = {it["slug"]: stats_cache.get(it["slug"]) for it in items}
-            q.put(("result", build_results(registry, items, cached, st_cached),
-                   f"识别完成 · {len(items)} 件 · 显示缓存价，更新中…"))
+            _put("result", build_results(registry, items, cached, st_cached),
+                 f"识别完成 · {len(items)} 件 · 显示缓存价，更新中…")
 
             # 2) 刷新最新价（主流程，优先级最高），刷新显示并写缓存
             fresh = fetch_fresh_prices(items)
             price_cache.update(fresh)
-            q.put(("result", build_results(registry, items, fresh, st_cached),
-                   f"识别完成 · {len(items)} 件 · 已更新 · 按 {HOTKEY.upper()} 重试"))
+            _put("result", build_results(registry, items, fresh, st_cached),
+                 f"识别完成 · {len(items)} 件 · 已更新 · 按 {HOTKEY.upper()} 重试")
 
             # 3) 48h 销量/均价：最低优先级，独立后台线程抓取，
             #    超时/失败即跳过，且不影响 busy 解锁与下次 F9。
             if STATS_ENABLED:
-                gen = run_gen["n"]
                 miss = [it for it in items if stats_cache.get(it["slug"]) is None]
                 if miss:
                     def _stats_worker():
@@ -908,33 +970,39 @@ def run_gui(registry):
                                 f"识别完成 · {len(items)} 件 · 含48h统计 · 按 {HOTKEY.upper()} 重试"
                                 if new_stats else
                                 f"识别完成 · {len(items)} 件 · 已更新 · 按 {HOTKEY.upper()} 重试")
-                            q.put(("result",
-                                   build_results(registry, items, fresh, st_final),
-                                   status_text))
+                            _put("result",
+                                 build_results(registry, items, fresh, st_final),
+                                 status_text)
                         except Exception:
                             pass
                     threading.Thread(target=_stats_worker, daemon=True).start()
         except Exception as e:
-            q.put(("error", f"出错: {e}"))
+            _put("error", f"出错: {e}")
         finally:
-            busy.clear()
+            timer.cancel()                  # 正常完成则取消看门狗，避免 30 秒后误报/误解锁
+            if gen == run_gen["n"]:
+                busy.clear()
 
-    def _unlock_if_stuck():
+    def _unlock_if_stuck(gen):
         # 看门狗：截图/OCR 可能挂起（尤其挂机/睡眠后），超时强制解锁，保证 F9 始终可用。
-        if busy.is_set():
+        # 携带 gen，只解锁自己那一代，不会误伤已开始的新一轮识别。
+        if busy.is_set() and gen == run_gen["n"]:
             q.put(("error", "识别超时（截图/OCR 卡住），已解锁热键，请重试"))
             busy.clear()
 
     def do_capture():
         # 热键回调必须立刻返回。若在此阻塞，keyboard 的监听线程被堵死，
         # 之后按 F9 就再也没反应（即「挂机太久按 F9 没反应」）。
+        # Tk 控件操作也走消息队列，回调里不直接碰 status。
+        if not ready.is_set():
+            q.put(("status", "数据加载中，请稍候…", "#8b93a1"))
+            return
         if busy.is_set():
             return
         busy.set()
-        run_gen["n"] += 1                     # 标记新一轮，使上一轮残留的后台统计线程放弃渲染
-        q.put(("status", "识别中..."))
+        run_gen["n"] += 1                     # 标记新一轮，使上一轮残留的后台线程放弃渲染
+        q.put(("status", "识别中...", "#8b93a1"))
         threading.Thread(target=capture_worker, daemon=True).start()
-        threading.Timer(CAPTURE_TIMEOUT, _unlock_if_stuck).start()
 
     def poll():
         try:
@@ -942,7 +1010,7 @@ def run_gui(registry):
                 msg = q.get_nowait()
                 kind = msg[0]
                 if kind == "status":
-                    status.config(text=msg[1], fg="#8b93a1")
+                    status.config(text=msg[1], fg=msg[2] if len(msg) > 2 else "#8b93a1")
                 elif kind == "result":
                     render_results(root, status, frame, fonts, msg[1], status_text=msg[2])
                 elif kind == "error":
@@ -960,7 +1028,6 @@ def run_gui(registry):
         render_results(root, status, frame, fonts, [],
                        err=f"热键注册失败（可能需要管理员权限）: {e}")
 
-    status.config(text=f"就绪 · 按 {HOTKEY.upper()} 截图识别")
     root.after(100, poll)
     root.mainloop()
 
@@ -969,11 +1036,17 @@ def main():
     args = sys.argv[1:]
     refresh = "--refresh" in args
     registry = ItemRegistry()
-    registry.load(force_refresh=refresh)
 
     if "--image" in args:
         i = args.index("--image")
+        if i + 1 >= len(args):
+            print("用法: python wf_price_tool.py --image <图片路径>", flush=True)
+            return
         path = args[i + 1]
+        if not os.path.exists(path):
+            print(f"图片不存在: {path}", flush=True)
+            return
+        registry.load(force_refresh=refresh)
         import numpy as np
         from PIL import Image
         img = np.asarray(Image.open(path).convert("RGB"))[:, :, ::-1]  # RGB->BGR
@@ -998,6 +1071,7 @@ def main():
         return
 
     if refresh:
+        registry.load(force_refresh=True)
         print("缓存已更新，可正常启动（python wf_price_tool.py）。", flush=True)
         return
 

@@ -435,48 +435,87 @@ def fetch_stats_for_items(items):
 
 
 # ---------------------------------------------------------------- 截图 + OCR
-def capture_screen():
+def capture_screen(timeout=10):
+    """在子线程里截图并等待，防止系统刚从睡眠/锁屏恢复时 GDI 截图永久挂起
+    把识别线程整个拖死（表现为按 F9 卡住直到看门狗超时）。"""
     import mss
     import numpy as np
-    with mss.MSS() as sct:
-        mon = sct.monitors[MONITOR]
-        shot = sct.grab(mon)
-        img = np.asarray(shot)[:, :, :3]   # BGRA -> BGR
-    return img
+    holder = {}
+
+    def _grab():
+        try:
+            with mss.MSS() as sct:
+                mon = sct.monitors[MONITOR]
+                shot = sct.grab(mon)
+                holder["img"] = np.asarray(shot)[:, :, :3]   # BGRA -> BGR
+        except Exception as e:
+            holder["err"] = e
+
+    t = threading.Thread(target=_grab, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"截图超时（>{timeout}s），系统可能刚从睡眠恢复，请重试一次")
+    if "err" in holder:
+        raise holder["err"]
+    return holder["img"]
 
 
-_OCR_ENGINE = None
-_OCR_LOCK = threading.Lock()        # OCR 引擎非线程安全，识别线程可能并发，需加锁
+class _OcrState:
+    """锁与引擎绑成一体：引擎挂死时把整个 state 换掉即可自愈，
+    挂死的旧线程持有旧锁自生自灭，不再阻塞后续识别。"""
+    __slots__ = ("lock", "engine")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.engine = None
 
 
-def _get_ocr_engine():
-    global _OCR_ENGINE
+_OCR_STATE = _OcrState()
+_OCR_LOCK_TIMEOUT = 5          # 等 OCR 锁超过该秒数，视为上次识别已挂死
+
+
+def _reset_ocr_state():
+    """丢弃可能挂死的引擎与锁，下一轮识别用全新引擎（自动重建）。"""
+    global _OCR_STATE
+    _OCR_STATE = _OcrState()
+
+
+def _get_ocr_engine(state):
     from rapidocr_onnxruntime import RapidOCR
-    if _OCR_ENGINE is None:
-        with _OCR_LOCK:                     # 双重检查，防止多线程重复建引擎
-            if _OCR_ENGINE is None:
-                _OCR_ENGINE = RapidOCR()
-    return _OCR_ENGINE
+    if state.engine is None:
+        state.engine = RapidOCR()
+    return state.engine
 
 
 def ocr_image(img):
-    with _OCR_LOCK:
-        engine = _get_ocr_engine()
+    state = _OCR_STATE
+    if not state.lock.acquire(timeout=_OCR_LOCK_TIMEOUT):
+        # 上一次识别挂死还持着锁：弃旧换新，保证本次识别能继续
+        _reset_ocr_state()
+        state = _OCR_STATE
+        state.lock.acquire()
+    try:
+        engine = _get_ocr_engine(state)
         result, _ = engine(img, use_cls=False)   # 中文横排无需方向分类，省时
+    finally:
+        state.lock.release()
     if not result:
         return []
     lines = [(item[0], str(item[1]), float(item[2])) for item in result]
     if OCR_REFINE:
-        lines = refine_ocr(img, lines)
+        lines = refine_ocr(img, lines, state)    # 传同一 state，避免中途被换后串锁
     return lines
 
 
-def refine_ocr(img, lines):
+def refine_ocr(img, lines, state=None):
     """二次识别：把整图识别出的文本框带边距裁剪出来，一次性批量再识别一遍。
     整图识别时小字（如长道具名）会被 det 阶段降采样，单框用原图分辨率重识别更准。
     逐框调用识别引擎开销极大（每次都有流水线初始化，48 框约 35s），
     这里把所有裁剪框拼成一个批次用 text_recognizer 一次前向完成（48 框约 2s）。
     最后取两次中置信度高的结果；批量失败则整体沿用整图结果。"""
+    if state is None:
+        state = _OCR_STATE
     h_img, w_img = img.shape[:2]
     crops, idxs, scores0 = [], [], []
     for k, (box, _text, score) in enumerate(lines):
@@ -493,8 +532,8 @@ def refine_ocr(img, lines):
             scores0.append(score)
     if not crops:
         return list(lines)
-    with _OCR_LOCK:
-        engine = _get_ocr_engine()
+    with state.lock:
+        engine = _get_ocr_engine(state)
         try:
             rec_res, _ = engine.text_recognizer(crops)
         except Exception:
@@ -622,7 +661,12 @@ def warmup():
     except Exception:
         pass
     try:
-        _get_ocr_engine()                    # 复用统一的懒初始化（内部已加锁）
+        state = _OCR_STATE
+        if state.lock.acquire(timeout=_OCR_LOCK_TIMEOUT):
+            try:
+                _get_ocr_engine(state)        # 持锁预加载模型，避免与识别线程重复构建
+            finally:
+                state.lock.release()
     except Exception:
         pass
 
@@ -726,7 +770,7 @@ def process_once(registry, image=None):
 
 
 # ---------------------------------------------------------------- GUI
-def build_ui():
+def build_ui(trigger=None):
     import tkinter as tk
     import tkinter.font as tkfont
 
@@ -742,13 +786,22 @@ def build_ui():
     f_price = tkfont.Font(family="Microsoft YaHei UI", size=20, weight="bold")
     f_badge = f_price                     # 价格与入库标签字体相同，直接复用
 
-    # 顶栏：状态文字 + 右上角图钉（切换是否置顶）
+    # 顶栏：状态文字 + 「识别」按钮 + 右上角图钉（切换是否置顶）
     topbar = tk.Frame(root, bg="#14161a")
     topbar.pack(fill="x", padx=12, pady=(10, 2))
 
     status = tk.Label(topbar, text="正在初始化...", bg="#14161a", fg="#8b93a1",
                       font=f_sub, anchor="w")
     status.pack(side="left", fill="x", expand=True)
+
+    # 「识别」按钮 + 空格键：全局热键被系统摘除时（钩子无响应会被 Windows 直接移除），
+    # 仍可通过窗口手动触发，不至于只能重启程序。
+    if trigger is not None:
+        cap_btn = tk.Button(topbar, text="识别", command=trigger, relief="flat", bd=0,
+                            bg="#2c313a", fg="#6bc17b", font=f_sub, cursor="hand2",
+                            activebackground="#3a4150", activeforeground="#6bc17b",
+                            padx=14)
+        cap_btn.pack(side="right", padx=(0, 8))
 
     pin_state = {"on": True}
 
@@ -884,7 +937,6 @@ def render_results(root, status, frame, fonts, results, err=None, status_text=No
 # ---------------------------------------------------------------- 入口
 def run_gui(registry):
     import tkinter as tk
-    root, status, frame, fonts = build_ui()
 
     ready = threading.Event()                 # 数据加载完成前，拒绝触发识别
 
@@ -893,6 +945,21 @@ def run_gui(registry):
     busy = threading.Event()
     price_cache = PriceCache(PRICE_CACHE_FILE)
     stats_cache = StatsCache(STATS_CACHE_FILE)
+
+    def do_capture():
+        # 热键/按钮/空格共用的触发入口，必须立刻返回，绝不做重活。
+        if not ready.is_set():
+            q.put(("status", "数据加载中，请稍候…", "#8b93a1"))
+            return
+        if busy.is_set():
+            return
+        busy.set()
+        run_gen["n"] += 1                     # 标记新一轮，使上一轮残留的后台线程放弃渲染
+        q.put(("status", "识别中...", "#8b93a1"))
+        threading.Thread(target=capture_worker, daemon=True).start()
+
+    root, status, frame, fonts = build_ui(trigger=do_capture)   # 按钮兜底需要回调
+    root.bind("<space>", lambda _e: do_capture())               # 窗口聚焦时空格也可触发
 
     status.config(text="正在加载数据（首次需联网下载）…", fg="#8b93a1")
 
@@ -928,6 +995,9 @@ def run_gui(registry):
         timer.start()
         try:
             items = identify_items(registry)
+            # 看门狗只覆盖最易挂死的「截图 + OCR」阶段（唯一无超时上限的环节）；
+            # 查价/统计每个请求自带超时与重试上限，天然有界，不该被误判为卡死。
+            timer.cancel()
             if not items:
                 _put("result", [], "未识别到道具，请确认画面停留在报酬界面")
                 return
@@ -987,22 +1057,33 @@ def run_gui(registry):
         # 看门狗：截图/OCR 可能挂起（尤其挂机/睡眠后），超时强制解锁，保证 F9 始终可用。
         # 携带 gen，只解锁自己那一代，不会误伤已开始的新一轮识别。
         if busy.is_set() and gen == run_gen["n"]:
-            q.put(("error", "识别超时（截图/OCR 卡住），已解锁热键，请重试"))
+            _reset_ocr_state()      # 丢掉可能挂死的引擎与锁，下次识别自动重建引擎
+            _rehook_keyboard()      # 挂死期间钩子可能被 Windows 移除，重挂热键
+            q.put(("error", "识别超时（截图/OCR 卡住），已自动修复，请重试"))
             busy.clear()
 
-    def do_capture():
-        # 热键回调必须立刻返回。若在此阻塞，keyboard 的监听线程被堵死，
-        # 之后按 F9 就再也没反应（即「挂机太久按 F9 没反应」）。
-        # Tk 控件操作也走消息队列，回调里不直接碰 status。
-        if not ready.is_set():
-            q.put(("status", "数据加载中，请稍候…", "#8b93a1"))
-            return
-        if busy.is_set():
-            return
-        busy.set()
-        run_gen["n"] += 1                     # 标记新一轮，使上一轮残留的后台线程放弃渲染
-        q.put(("status", "识别中...", "#8b93a1"))
-        threading.Thread(target=capture_worker, daemon=True).start()
+    _hotkey_alive = threading.Event()
+
+    def _rehook_keyboard():
+        """重新注册全局热键。Windows 会在钩子无响应时直接摘除它，
+        之后按 F9 就再也没反应、只能重启程序——这里在后台静默重挂实现自愈。"""
+        def _do():
+            try:
+                import keyboard
+                try:
+                    keyboard.remove_hotkey(HOTKEY)
+                except Exception:
+                    pass
+                keyboard.add_hotkey(HOTKEY, do_capture)
+                _hotkey_alive.set()
+            except Exception:
+                _hotkey_alive.clear()
+        try:
+            threading.Thread(target=_do, daemon=True).start()
+        except Exception:
+            pass
+
+    _rehook_keyboard()              # 空跑一次初始注册：失败也无妨，下面还有兜底
 
     def poll():
         try:
@@ -1021,12 +1102,16 @@ def run_gui(registry):
             pass   # 渲染出错也不能中断 poll，否则界面会卡死、看起来像没反应
         root.after(100, poll)
 
+    # 初始注册统一交给 _rehook_keyboard 的后台线程（与重挂同一条路），
+    # 此处只等待其结果，避免主线程再 add 一次造成同一热键双重注册。
     try:
         import keyboard
-        keyboard.add_hotkey(HOTKEY, do_capture)
+        if not _hotkey_alive.wait(timeout=8):
+            render_results(root, status, frame, fonts, [],
+                           err=f"热键注册失败（可能需要管理员权限），请用窗口里的「识别」按钮或空格键")
     except Exception as e:
         render_results(root, status, frame, fonts, [],
-                       err=f"热键注册失败（可能需要管理员权限）: {e}")
+                       err=f"热键注册失败，请用窗口里的「识别」按钮或空格键: {e}")
 
     root.after(100, poll)
     root.mainloop()

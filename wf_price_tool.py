@@ -596,19 +596,40 @@ def group_name_lines(lines, img):
     narrow = [e for e in entries if e["w"] <= max_col_w]
     wide = [e for e in entries if e["w"] > max_col_w]
 
+    # 二次过滤：宽度显著大于典型物品名（中位数）的框，多为跨列大标题
+    # （如仓库界面「仓库/出售」det 框横跨两列）。它们一旦参与列聚类，
+    # 会把覆盖范围内的所有物品名吞进同一列，破坏折行合并。
+    if narrow:
+        w_med = sorted(e["w"] for e in narrow)[len(narrow) // 2]
+        w_cap = w_med * 1.8
+        outliers = [e for e in narrow if e["w"] > w_cap]
+        if outliers and len(outliers) < len(narrow):
+            wide.extend(outliers)
+            narrow = [e for e in narrow if e["w"] <= w_cap]
+
     narrow.sort(key=lambda e: e["bbox"][0])
     cols = []
     for e in narrow:
         placed = False
         for col in cols:
-            if e["bbox"][0] <= col["x1"] + 20:     # x 区间重叠（含小间隙容差）
+            # 与列现有区间必须严格重叠（无容差，x 与 y 都要重叠）：
+            # - x 无容差：仓库网格列间隙仅 ~15px，任何容差都会让列边界在按 x
+            #   排序遍历时链式右扩，把整页吞成一个巨型列，折行全名跨列串并；
+            # - y 重叠：跨行漂移的 det 框（框体横向拖到相邻列）若只按 x 判定，
+            #   会把上下不同网格行的物品名拉进同一列，破坏折行合并。
+            # 折行的两行 y 紧邻相交，不受影响。
+            if (e["bbox"][0] <= col["x1"] and e["bbox"][2] >= col["x0"]
+                    and e["bbox"][1] <= col["y1"] and e["bbox"][3] >= col["y0"]):
                 col["x0"] = min(col["x0"], e["bbox"][0])
                 col["x1"] = max(col["x1"], e["bbox"][2])
+                col["y0"] = min(col["y0"], e["bbox"][1])
+                col["y1"] = max(col["y1"], e["bbox"][3])
                 col["members"].append(e)
                 placed = True
                 break
         if not placed:
-            cols.append({"x0": e["bbox"][0], "x1": e["bbox"][2], "members": [e]})
+            cols.append({"x0": e["bbox"][0], "x1": e["bbox"][2],
+                         "y0": e["bbox"][1], "y1": e["bbox"][3], "members": [e]})
 
     groups = []
     for col in cols:
@@ -677,9 +698,10 @@ def identify_items(registry, image=None):
     img = image if image is not None else capture_screen()
     lines = ocr_image(img)
     groups = group_name_lines(lines, img)
-    # 优先只用含道具名色的组（金色屏幕的金名；过滤白色玩家名等干扰），
-    # 没有任何这类组（如白字密集表格界面）时回退到全部文字（每行独立匹配）。
-    gold_groups = [g for g in groups if any(e["gold"] is not False for e in g)]
+    # 优先只用含道具名色（金色）的组，过滤白色玩家名等干扰。
+    # 注意必须 gold is True：None（太暗/裁剪失败无法判色）不算金名，
+    # 否则白字界面（仓库网格）里个别 None 行会凑出假的 gold 组并提前返回。
+    gold_groups = [g for g in groups if any(e["gold"] is True for e in g)]
     attempts = ([gold_groups, groups]
                 if (GOLD_FILTER and gold_groups) else [groups])
     for cand_groups in attempts:
@@ -692,7 +714,10 @@ def identify_items(registry, image=None):
             if it and it["slug"] not in seen:
                 seen.add(it["slug"])
                 items.append(it)
-        if items:
+        # gold 组匹配数过少时不可信（偶发误判金的杂行），继续尝试全量组兜底；
+        # 全量组（cand_groups 即 groups）只要有结果就返回。
+        if items and (cand_groups is groups
+                      or len(items) >= 2 or len(gold_groups) * 2 >= len(groups)):
             return items
     return []
 

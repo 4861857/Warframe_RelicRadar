@@ -162,6 +162,12 @@ class ItemRegistry:
     def load(self, force_refresh=False):
         need_items = force_refresh or not os.path.exists(CACHE_FILE)
         need_relic = force_refresh or not os.path.exists(RELIC_FILE)
+        if not need_items:
+            # 旧版缓存无 ducats 字段时重新下载，补上杜卡德面值
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                self.items = json.load(f)
+            if not any("ducats" in it for it in self.items):
+                need_items = True
         if need_items and need_relic:
             # 两份缓存都缺失时并行下载，冷启动省一半时间
             import concurrent.futures as _cf
@@ -201,9 +207,12 @@ class ItemRegistry:
             zh = it.get("i18n", {}).get("zh-hans", {}).get("name", "")
             en = it.get("i18n", {}).get("en", {}).get("name", "")
             if zh:
+                # 套装在游戏里不能卖给商店换杜卡德，面值置 0（显示端跳过）
+                ducats = 0 if "set" in (it.get("tags") or []) else it.get("ducats") or 0
                 items.append({
                     "slug": it["slug"], "zh": zh, "en": en,
                     "vaulted": it.get("vaulted"),   # 只有遗物会有值
+                    "ducats": ducats,               # 杜卡德面值（0=不可换）
                 })
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False)
@@ -763,8 +772,20 @@ def build_results(registry, items, prices, stats=None):
             "vol_48h": vol,
             "avg_48h": avg,
             "stats_timeout": timeout,
+            **_ducat_entry(it, p),
         })
     return results
+
+
+def _ducat_entry(item, price):
+    """杜卡德金币/白金条目：按当前取到的价格折算每白金能换的金币数。
+    参考价取卖家最低白金价；道具不可换金币（面值 0）或没有价格时
+    返回空条目（显示端跳过）。"""
+    ducats = item.get("ducats") or 0
+    ref = price.get("low") if price else None
+    if ducats > 0 and ref:
+        return {"ducats": ducats, "dpp": ducats / ref}
+    return {"ducats": 0, "dpp": None}
 
 
 def process_once(registry, image=None):
@@ -951,6 +972,12 @@ def render_results(root, status, frame, fonts, results, err=None, status_text=No
                      font=f_sub).pack(side="left", padx=(18, 0))
         elif r.get("stats_timeout"):
             tk.Label(bot, text="48h 统计超时", bg="#1e2229", fg="#e05c5c",
+                     font=f_sub).pack(side="left", padx=(18, 0))
+
+        dpp = r.get("dpp")
+        if dpp is not None:   # 不可换金币或无价格的道具不显示（跳过）
+            tk.Label(bot, text=f"杜卡德 {r['ducats']} · {dpp:.1f} 金币/白金",
+                     bg="#1e2229", fg="#c8a951",
                      font=f_sub).pack(side="left", padx=(18, 0))
 
         age = _fmt_age(r.get("cache_ts"))
@@ -1178,6 +1205,8 @@ def main():
                 print(s)
             elif r.get("stats_timeout"):
                 print("    48h 统计: 超时")
+            if r.get("dpp") is not None:   # 不可换金币或无价格则跳过
+                print(f"    杜卡德: {r['ducats']} | {r['dpp']:.1f} 金币/白金")
         return
 
     if refresh:
